@@ -5,6 +5,54 @@ import numpy as np
 import scipy as sp
 import networkx as nx
 
+cupy_not_found = False
+try:
+    import cupy as cp
+except ImportError:
+    cupy_not_found = True
+
+
+class _PCGSolverCP:
+    def __init__(self, A, M):
+        self._A = A
+        self._M = M
+
+    def solve(self, B, tol, max_iter=5000):
+        with cp.cuda.Device(0):
+            A = self._A
+            M = self._M
+            B = np.squeeze(B)
+            tol *= sp.linalg.blas.dasum(B)
+            b = cp.asarray(B)
+            r = B.copy()
+            z = M(r)
+            p = z.copy()
+            Ap = self._A(p)
+            A = cp.asarray(Ap)
+            return self._fit(A, b, tol, max_iter)
+
+    @staticmethod
+    def _fit(A, b, tol, max_iter):
+        # Note that this function works even tensors 'A' and 'b' are NumPy or CuPy
+        # arrays.
+        xp = cp.get_array_module(A)
+        x = xp.zeros_like(b, dtype=np.float64)
+        r0 = b - xp.dot(A, x)
+        p = r0
+        for i in range(max_iter):
+            a = xp.inner(r0, r0) / xp.inner(p, xp.dot(A, p))
+            x += a * p
+            r1 = r0 - a * xp.dot(A, p)
+            if xp.linalg.norm(r1) < tol:
+                break
+            b = xp.inner(r1, r1) / xp.inner(r0, r0)
+            p = r1 + b * p
+            r0 = r1
+        else:
+            print('Failed to converge. Increase max-iter or tol.')
+        ret = np.expand_dims(cp.asnumpy(x), axis=1)
+        return ret
+
 
 class _PCGSolver:
     """Preconditioned conjugate gradient method.
@@ -121,7 +169,8 @@ def _tracemin_fiedler(L, X, normalized, tol):
                 X[:, j] -= X[:, j].sum() / n
 
     D = L.diagonal().astype(float)
-    solver = _PCGSolver(lambda x: L @ x, lambda x: D * x)
+    solver_class = _PCGSolver if cupy_not_found else _PCGSolverCP
+    solver = solver_class(lambda x: L @ x, lambda x: D * x)
 
     # Initialize.
     Lnorm = abs(L).sum(axis=1).flatten().max()
