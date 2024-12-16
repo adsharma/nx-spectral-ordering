@@ -279,7 +279,7 @@ def fiedler_vector(
 
 
 def spectral_ordering(
-    G, weight="weight", normalized=False, tol=1e-8, method="tracemin_pcg", seed=None
+    G, weight="weight", normalized=False, tol=1e-8, method="tracemin_pcg", seed=np.random
 ):
     """Compute the spectral_ordering of a graph.
 
