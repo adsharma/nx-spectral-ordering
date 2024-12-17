@@ -4,54 +4,15 @@
 import numpy as np
 import scipy as sp
 import networkx as nx
+import cupy as cp
 
-cupy_not_found = False
+GPU = 0
 try:
-    import cupy as cp
-except ImportError:
-    cupy_not_found = True
-
-
-class _PCGSolverCP:
-    def __init__(self, A, M):
-        self._A = A
-        self._M = M
-
-    def solve(self, B, tol, max_iter=5000):
-        with cp.cuda.Device(0):
-            A = self._A
-            M = self._M
-            B = np.squeeze(B)
-            tol *= sp.linalg.blas.dasum(B)
-            b = cp.asarray(B)
-            r = B.copy()
-            z = M(r)
-            p = z.copy()
-            Ap = self._A(p)
-            A = cp.asarray(Ap)
-            return self._fit(A, b, tol, max_iter)
-
-    @staticmethod
-    def _fit(A, b, tol, max_iter):
-        # Note that this function works even tensors 'A' and 'b' are NumPy or CuPy
-        # arrays.
-        xp = cp.get_array_module(A)
-        x = xp.zeros_like(b, dtype=np.float64)
-        r0 = b - xp.dot(A, x)
-        p = r0
-        for i in range(max_iter):
-            a = xp.inner(r0, r0) / xp.inner(p, xp.dot(A, p))
-            x += a * p
-            r1 = r0 - a * xp.dot(A, p)
-            if xp.linalg.norm(r1) < tol:
-                break
-            b = xp.inner(r1, r1) / xp.inner(r0, r0)
-            p = r1 + b * p
-            r0 = r1
-        else:
-            print('Failed to converge. Increase max-iter or tol.')
-        ret = np.expand_dims(cp.asnumpy(x), axis=1)
-        return ret
+    cp.cuda.Device().compute_capability
+    GPU = 1
+    print("Using GPU")
+except cp.cuda.runtime.CUDARuntimeError:
+    print("CUDA GPU not available")
 
 
 class _PCGSolver:
@@ -73,8 +34,9 @@ class _PCGSolver:
     def __init__(self, A, M):
         self._A = A
         self._M = M
+        self.solve = self._solve_gpu if GPU else self._solve_cpu
 
-    def solve(self, B, tol):
+    def _solve_cpu(self, B, tol):
         # Densifying step - can this be kept sparse?
         B = np.asarray(B)
         X = np.ndarray(B.shape, order="F")
@@ -82,28 +44,37 @@ class _PCGSolver:
             X[:, j] = self._solve(B[:, j], tol)
         return X
 
+    def _solve_gpu(self, B, tol):
+        with cp.cuda.Device(0):
+            B = cp.asarray(B)
+            X = cp.ndarray(B.shape, order="F")
+            for j in range(B.shape[1]):
+                X[:, j] = self._solve(B[:, j], tol)
+            return X
+
     def _solve(self, b, tol):
+        xp = cp.get_array_module(b)
         A = self._A
         M = self._M
-        tol *= sp.linalg.blas.dasum(b)
+        tol *= xp.linalg.norm(b, ord=1)
         # Initialize.
-        x = np.zeros(b.shape)
+        x = xp.zeros(b.shape)
         r = b.copy()
         z = M(r)
-        rz = sp.linalg.blas.ddot(r, z)
+        rz = xp.dot(r, z)
         p = z.copy()
         # Iterate.
         while True:
             Ap = A(p)
-            alpha = rz / sp.linalg.blas.ddot(p, Ap)
-            x = sp.linalg.blas.daxpy(p, x, a=alpha)
-            r = sp.linalg.blas.daxpy(Ap, r, a=-alpha)
-            if sp.linalg.blas.dasum(r) < tol:
+            alpha = rz / xp.dot(p, Ap)
+            x += alpha * p
+            r += -alpha * Ap
+            if xp.linalg.norm(r, ord=1) < tol:
                 return x
             z = M(r)
-            beta = sp.linalg.blas.ddot(r, z)
+            beta = xp.dot(r, z)
             beta, rz = beta / rz, beta
-            p = sp.linalg.blas.daxpy(p, z, a=beta)
+            p = beta * p + z
 
 
 def _tracemin_fiedler(L, X, normalized, tol):
@@ -162,41 +133,47 @@ def _tracemin_fiedler(L, X, normalized, tol):
 
     else:
 
-        def project(X):
+        def project(X, xp):
             """Make X orthogonal to the nullspace of L."""
-            X = np.asarray(X)
+            X = xp.asarray(X)
             for j in range(X.shape[1]):
                 X[:, j] -= X[:, j].sum() / n
 
     D = L.diagonal().astype(float)
-    solver_class = _PCGSolver if cupy_not_found else _PCGSolverCP
-    solver = solver_class(lambda x: L @ x, lambda x: D * x)
+    if GPU:
+        L = cp.sparse.csr_matrix(L)
+        D = cp.asarray(D)
+        X = cp.asarray(X)
+    xp = cp.get_array_module(X)
+    solver = _PCGSolver(lambda x: L @ x, lambda x: D * x)
 
     # Initialize.
     Lnorm = abs(L).sum(axis=1).flatten().max()
-    project(X)
-    W = np.ndarray(X.shape, order="F")
+    project(X, xp)
+    W = xp.ndarray(X.shape, order="F")
 
     while True:
         # Orthonormalize X.
-        X = np.linalg.qr(X)[0]
+        X = xp.linalg.qr(X)[0]
         # Compute iteration matrix H.
         W[:, :] = L @ X
         H = X.T @ W
-        sigma, Y = sp.linalg.eigh(H, overwrite_a=True)
+        sigma, Y = xp.linalg.eigh(H)
         # Compute the Ritz vectors.
         X = X @ Y
         # Test for convergence exploiting the fact that L * X == W * Y.
-        res = sp.linalg.blas.dasum(W @ Y[:, 0] - sigma[0] * X[:, 0]) / Lnorm
+        res = xp.linalg.norm(W @ Y[:, 0] - sigma[0] * X[:, 0], ord=1) / Lnorm
         if res < tol:
             break
         # Compute X = L \ X / (X' * (L \ X)).
         # L \ X can have an arbitrary projection on the nullspace of L,
         # which will be eliminated.
         W[:, :] = solver.solve(X, tol)
-        X = (sp.linalg.inv(W.T @ X) @ W.T).T  # Preserves Fortran storage order.
-        project(X)
+        X = (xp.linalg.inv(W.T @ X) @ W.T).T  # Preserves Fortran storage order.
+        project(X, xp)
 
+    if GPU:
+        X = cp.asnumpy(X)
     return sigma, np.asarray(X)
 
 
@@ -328,7 +305,12 @@ def fiedler_vector(
 
 
 def spectral_ordering(
-    G, weight="weight", normalized=False, tol=1e-8, method="tracemin_pcg", seed=np.random
+    G,
+    weight="weight",
+    normalized=False,
+    tol=1e-8,
+    method="tracemin_pcg",
+    seed=np.random,
 ):
     """Compute the spectral_ordering of a graph.
 
