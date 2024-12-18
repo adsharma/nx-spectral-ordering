@@ -5,6 +5,7 @@ import numpy as np
 import scipy as sp
 import networkx as nx
 import cupy as cp
+from cupyx import jit
 
 GPU = 0
 try:
@@ -52,26 +53,51 @@ class _PCGSolver:
                 X[:, j] = self._solve(B[:, j], tol)
             return X
 
+    @jit.rawkernel()
+    @staticmethod
+    def _jit_solve(A, M, b, tol):
+        tol *= cp.linalg.norm(b, ord=1)
+        # Initialize.
+        x = cp.zeros(b.shape)
+        r = b.copy()
+        z = M * r
+        rz = cp.dot(r, z)
+        p = z.copy()
+        # Iterate.
+        while True:
+            Ap = A @ p
+            alpha = rz / cp.dot(p, Ap)
+            x += alpha * p
+            r += -alpha * Ap
+            if cp.linalg.norm(r, ord=1) < tol:
+                return x
+            z = M * r
+            beta = cp.dot(r, z)
+            beta, rz = beta / rz, beta
+            p = beta * p + z
+
     def _solve(self, b, tol):
         xp = cp.get_array_module(b)
         A = self._A
         M = self._M
+        if xp == cp:
+            return self._jit_solve[64, 64](A, M, b, tol)
         tol *= xp.linalg.norm(b, ord=1)
         # Initialize.
         x = xp.zeros(b.shape)
         r = b.copy()
-        z = M(r)
+        z = M * r
         rz = xp.dot(r, z)
         p = z.copy()
         # Iterate.
         while True:
-            Ap = A(p)
+            Ap = A @ p
             alpha = rz / xp.dot(p, Ap)
             x += alpha * p
             r += -alpha * Ap
             if xp.linalg.norm(r, ord=1) < tol:
                 return x
-            z = M(r)
+            z = M * r
             beta = xp.dot(r, z)
             beta, rz = beta / rz, beta
             p = beta * p + z
@@ -145,7 +171,7 @@ def _tracemin_fiedler(L, X, normalized, tol):
         D = cp.asarray(D)
         X = cp.asarray(X)
     xp = cp.get_array_module(X)
-    solver = _PCGSolver(lambda x: L @ x, lambda x: D * x)
+    solver = _PCGSolver(L, D)
 
     # Initialize.
     Lnorm = abs(L).sum(axis=1).flatten().max()
